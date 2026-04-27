@@ -159,6 +159,7 @@ from greaseweazle.codec.apple2 import apple2_gcr
 from greaseweazle.codec.hp import hp_mmfm
 from greaseweazle.codec.northstar import northstar
 from greaseweazle.codec.micropolis import micropolis
+from greaseweazle.codec.alcyane import alcyane
 from greaseweazle.codec.datageneral import datageneral
 
 def mk_trackdef(format_name: str) -> TrackDef:
@@ -178,6 +179,8 @@ def mk_trackdef(format_name: str) -> TrackDef:
         return northstar.NorthStarDef(format_name)
     if format_name in ['micropolis']:
         return micropolis.MicropolisDef(format_name)
+    if format_name in ['alcyane']:
+        return alcyane.AlcyaneDef(format_name)
     if format_name in ['apple2.gcr']:
         return apple2_gcr.Apple2GCRDef(format_name)
     if format_name in ['bitcell']:

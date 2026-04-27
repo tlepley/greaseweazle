@@ -88,6 +88,14 @@ def process_input_track(
             dat.decode_flux(track, pll)
         print("%s: %s from %s" % (tspec, dat.summary_string(),
                                   track.summary_string()))
+        if hasattr(dat, 'physical_sector_order'):
+            order = getattr(dat, 'physical_sector_order')
+            try:
+                order_txt = ",".join(map(str, order))
+            except TypeError:
+                order_txt = ""
+            if order_txt:
+                print("         -> Sector ordering : %s" % order_txt)
 
     return dat
 
