@@ -88,7 +88,7 @@ def process_input_track(
             dat.decode_flux(track, pll)
         print("%s: %s from %s" % (tspec, dat.summary_string(),
                                   track.summary_string()))
-        if hasattr(dat, 'physical_sector_order'):
+        if hasattr(dat, 'physical_sector_order') and not hasattr(dat, 'sector_ids'):
             order = getattr(dat, 'physical_sector_order')
             try:
                 order_txt = ",".join(map(str, order))

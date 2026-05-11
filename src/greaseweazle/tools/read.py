@@ -88,7 +88,7 @@ def read_with_retry(usb: USB.Unit, args, t) -> Tuple[Flux, Optional[HasFlux]]:
         if retry != 0:
             s += " (Retry #%u.%u)" % (seek_retry, retry)
         print(s)
-        if hasattr(dat, 'physical_sector_order'):
+        if hasattr(dat, 'physical_sector_order') and not hasattr(dat, 'sector_ids'):
             order = getattr(dat, 'physical_sector_order')
             try:
                 order_txt = ",".join(map(str, order))
