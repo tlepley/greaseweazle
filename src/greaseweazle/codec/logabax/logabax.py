@@ -9,9 +9,6 @@ from greaseweazle.track import PLL, MasterTrack
 from greaseweazle.flux import HasFlux
 
 
-header_sync_bits = bitarray('11111011', endian='big')
-
-
 def _runs_of_byte(buf: bytes, value: int) -> List[Tuple[int, int]]:
     runs: List[Tuple[int, int]] = []
     i = 0
@@ -209,6 +206,16 @@ def _slot_starts_from_ticks(slots: List[float]) -> List[float]:
         acc += t
         starts.append(acc)
     return starts
+
+
+def _parse_hex_bytes(spec: str) -> bytes:
+    txt = spec.replace(",", " ").replace("0x", "").replace("0X", "")
+    parts = [p for p in txt.split() if p]
+    error.check(parts, f"empty sync byte specification: {spec!r}")
+    try:
+        return bytes(int(p, 16) for p in parts)
+    except ValueError as exc:
+        raise error.Fatal(f"invalid hex byte list: {spec!r}") from exc
 
 
 def _xor8(buf: bytes) -> int:
@@ -439,6 +446,21 @@ class Logabax(codec.Codec):
     def dbg(self) -> bool:
         return self.config.debug
 
+    @property
+    def sync_prezero_bits(self) -> int:
+        return self.config.sync_prezero_bits
+
+    @property
+    def sync_bytes(self) -> bytes:
+        return self.config.sync_bytes
+
+    @property
+    def sync_pattern_bits(self) -> bitarray:
+        bits = bitarray('0' * self.sync_prezero_bits, endian='big')
+        for b in self.sync_bytes:
+            bits.frombytes(bytes([b]))
+        return bits
+
     def summary_string(self) -> str:
         ok = self.nsec - self.nr_missing()
         return f"Logabax LX500 ({ok}/{self.nsec} sectors)"
@@ -569,7 +591,7 @@ class Logabax(codec.Codec):
             search_pos = 0
             while search_pos < len(bits):
                 header_syncs = _find_syncs(
-                    bits, search_pos, len(bits), header_sync_bits
+                    bits, search_pos, len(bits), self.sync_pattern_bits
                 )
                 if not header_syncs:
                     if self.dbg():
@@ -590,7 +612,11 @@ class Logabax(codec.Codec):
                     break
 
                 header_sync_start = header_syncs[0]
-                header_bit = header_sync_start
+                header_bit = (
+                    header_sync_start
+                    + self.sync_prezero_bits
+                    + self.config.header_skip_bytes * 8
+                )
                 data_start_bit = header_bit + 3 * 8
                 slot_idx = min(
                     max(search_pos * self.nsec // max(len(bits), 1), 0),
@@ -610,11 +636,12 @@ class Logabax(codec.Codec):
                 if len(header) < 3:
                     search_pos = header_sync_start + 1
                     continue
-                if header[0] != 0xfb:
+                if (self.config.header_mark is not None
+                        and header[0] != self.config.header_mark):
                     search_pos = header_sync_start + 1
                     continue
-                track_id = header[1]
-                sector_id = header[2]
+                track_id = header[self.config.track_id_offs]
+                sector_id = header[self.config.sector_id_offs]
                 logical_sec_id = sector_id - 1
                 if track_id != self.cyl:
                     if self.dbg():
@@ -684,6 +711,7 @@ class Logabax(codec.Codec):
                     final_payload = payload[:self.img_bps]
                 else:
                     final_payload = payload + bytes(self.img_bps - len(payload))
+                first_time_seen = not bool(self.sector_seen[sec_id])
                 self.add_or_compare(sec_id, final_payload, rev)
 
                 head_hex = final_payload[:16].hex(' ')
@@ -701,15 +729,17 @@ class Logabax(codec.Codec):
                     print(f"[logabax]   data_end:   {tail_hex}")
                     print(f"[logabax]   trailer_start: {trailer_hex}")
                     print(f"[logabax]   trailer_end:   {trailer_tail_hex}")
-                if len(final_payload) == self.img_bps and final_payload and final_payload.count(final_payload[0]) == len(final_payload):
+                if (rev == 0 and len(final_payload) == self.img_bps
+                        and final_payload
+                        and final_payload.count(final_payload[0]) == len(final_payload)
+                        and first_time_seen):
                     crc_txt = f"{trailer[0]:02x}" if trailer else "--"
                     post_crc_txt = f"{post_crc_byte:02x}" if post_crc_byte is not None else "--"
-                    if self.dbg():
-                        print(f"[logabax] uniform T{self.cyl}.{self.head} "
-                              f"R{rev} S{sector_id} header={header.hex(' ')} "
-                              f"value={final_payload[0]:02x} "
-                              f"crc={crc_txt} next={post_crc_txt} "
-                              f"sync_bit={header_sync_start}")
+                    print(f"[logabax] uniform T{self.cyl}.{self.head} "
+                          f"R{rev} S{sector_id} header={header.hex(' ')} "
+                          f"value={final_payload[0]:02x} "
+                          f"crc={crc_txt} next={post_crc_txt} "
+                          f"sync_bit={header_sync_start}")
                 if trailer and self.dbg():
                     crc_byte = trailer[0]
                     print(f"[logabax]   crc_byte: {crc_byte:02x}")
@@ -792,6 +822,12 @@ class LogabaxDef(codec.TrackDef):
         self.img_bps: Optional[int] = None
         self.min_zero_run: int = 16
         self.debug: bool = False
+        self.sync_bytes: bytes = bytes([0xfb])
+        self.sync_prezero_bits: int = 0
+        self.header_skip_bytes: int = 0
+        self.header_mark: Optional[int] = 0xfb
+        self.track_id_offs: int = 1
+        self.sector_id_offs: int = 2
         self.finalised = False
 
     def add_param(self, key: str, val) -> None:
@@ -803,6 +839,19 @@ class LogabaxDef(codec.TrackDef):
             self.min_zero_run = int(val)
         elif key == 'debug':
             self.debug = (str(val).lower() == 'true')
+        elif key == 'sync':
+            self.sync_bytes = _parse_hex_bytes(str(val))
+        elif key == 'sync_prezero_bits':
+            self.sync_prezero_bits = int(val)
+        elif key == 'header_skip_bytes':
+            self.header_skip_bytes = int(val)
+        elif key == 'header_mark':
+            sval = str(val).strip().lower()
+            self.header_mark = None if sval in ('none', 'off', '-1') else int(sval, 0)
+        elif key == 'track_id_offs':
+            self.track_id_offs = int(val)
+        elif key == 'sector_id_offs':
+            self.sector_id_offs = int(val)
         else:
             raise error.Fatal('unrecognised track option %s' % key)
 
@@ -813,6 +862,16 @@ class LogabaxDef(codec.TrackDef):
                     'number of sectors not specified')
         error.check(self.img_bps is not None,
                     'img_bps not specified')
+        error.check(len(self.sync_bytes) > 0,
+                    'sync byte pattern must not be empty')
+        error.check(self.sync_prezero_bits >= 0,
+                    'sync_prezero_bits must be >= 0')
+        error.check(self.header_skip_bytes >= 0,
+                    'header_skip_bytes must be >= 0')
+        error.check(0 <= self.track_id_offs < 3,
+                    'track_id_offs must be in range 0..2')
+        error.check(0 <= self.sector_id_offs < 3,
+                    'sector_id_offs must be in range 0..2')
         self.finalised = True
 
     def mk_track(self, cyl: int, head: int) -> Logabax:
