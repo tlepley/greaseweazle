@@ -94,12 +94,25 @@ class HPMMFM(codec.Codec):
     def __init__(self, cyl: int, head: int, config):
         self.cyl, self.head = cyl, head
         self.config = config
+        # IMD has no HP MMFM mode. Mode 3 records this as a 500kbps
+        # MFM-rate sector image while the actual MMFM decode is done here.
+        self.imd_mode = 3
         self.sector: List[Optional[bytes]]
         self.sector = [None] * self.nsec
+        self.sector_present: List[bool] = [False] * self.nsec
+        self.sector_data_error: List[bool] = [False] * self.nsec
+        self.sector_cyls: List[int] = [self.cyl] * self.nsec
+        self.sector_heads: List[int] = [self.head] * self.nsec
+        self.sector_ids: List[int] = list(range(self.nsec))
+        self.physical_sector_order: List[int] = list(range(self.nsec))
 
     @property
     def nsec(self) -> int:
         return self.config.secs
+
+    @property
+    def img_bps(self) -> int:
+        return 256
 
     def summary_string(self) -> str:
         nsec, nbad = self.nsec, self.nr_missing()
@@ -107,20 +120,29 @@ class HPMMFM(codec.Codec):
         return s
 
     # private
-    def add(self, sec_id, data) -> None:
-        assert not self.has_sec(sec_id)
+    def add(self, sec_id, data, data_error: bool = False) -> None:
         self.sector[sec_id] = data
+        self.sector_present[sec_id] = True
+        self.sector_data_error[sec_id] = data_error
+
+    # private
+    def note_sector_id(self, sec_id, cyl, head) -> None:
+        self.sector_present[sec_id] = True
+        self.sector_cyls[sec_id] = cyl
+        self.sector_heads[sec_id] = int(head)
+        self.sector_ids[sec_id] = sec_id
 
     def has_sec(self, sec_id: int) -> bool:
-        return self.sector[sec_id] is not None
+        return (self.sector[sec_id] is not None
+                and not self.sector_data_error[sec_id])
 
     def nr_missing(self) -> int:
-        return len([sec for sec in self.sector if sec is None])
+        return len([sec for sec in range(self.nsec) if not self.has_sec(sec)])
 
     def get_img_track(self) -> bytearray:
         tdat = bytearray()
-        for sec in self.sector:
-            tdat += sec if sec is not None else bad_sector
+        for sec_id, sec in enumerate(self.sector):
+            tdat += sec if self.has_sec(sec_id) and sec is not None else bad_sector
         return tdat
 
     def set_img_track(self, tdat: bytes) -> int:
@@ -129,12 +151,20 @@ class HPMMFM(codec.Codec):
             tdat += bytes(totsize - len(tdat))
         for sec in range(self.nsec):
             self.sector[sec] = tdat[sec*256:(sec+1)*256]
+            self.sector_present[sec] = True
+            self.sector_data_error[sec] = False
+            self.sector_cyls[sec] = self.cyl
+            self.sector_heads[sec] = self.head
+            self.sector_ids[sec] = sec
         return totsize
 
     def decode_flux(self, track: HasFlux, pll: Optional[PLL]=None) -> None:
         raw = PLLTrack(time_per_rev = self.time_per_rev,
                        clock = self.clock, data = track, pll = pll)
         bits, _ = raw.get_all_data()
+
+        found_order: List[int] = []
+        found_order_seen = set()
 
         for offs in bits.search(sector_sync):
 
@@ -148,15 +178,17 @@ class HPMMFM(codec.Codec):
             if crc16.new(idam).crcValue != 0:
                 continue
             cyl = bitrev(idam[0])
-            sec_id = bitrev(idam[1])
-            head = (sec_id & 128) == 128
-            sec_id &= 127
-            if cyl != self.cyl or head != self.head or sec_id > self.nsec:
+            raw_sec_id = bitrev(idam[1])
+            head = (raw_sec_id & 128) == 128
+            sec_id = raw_sec_id & 127
+            if sec_id >= self.nsec:
                 print('T%d.%d: Ignoring unexpected sector C:%d H:%d R:%d'
                       % (self.cyl, self.head, cyl, head, sec_id))
                 continue
-            if self.has_sec(sec_id):
-                continue
+            self.note_sector_id(sec_id, cyl, head)
+            if sec_id not in found_order_seen:
+                found_order_seen.add(sec_id)
+                found_order.append(sec_id)
 
             # Find data
             offs += 8*16
@@ -168,14 +200,25 @@ class HPMMFM(codec.Codec):
             sec = decode(bits[offs:offs+258*16].tobytes())
             if len(sec) != 258:
                 continue
-            if crc16.new(sec).crcValue != 0:
-                continue
+            data_error = crc16.new(sec).crcValue != 0
 
             # bit swap, and byte swap
             sec = bytes(map(lambda x: bitrev(x), sec[:256]))
             sec = struct.pack('<128H', *struct.unpack('>128H', sec))
 
-            self.add(sec_id, sec)
+            if not self.has_sec(sec_id):
+                self.add(sec_id, sec, data_error=data_error)
+
+        seen = set()
+        order = []
+        for sec_id in found_order:
+            if sec_id not in seen:
+                seen.add(sec_id)
+                order.append(sec_id)
+        for sec_id in range(self.nsec):
+            if sec_id not in seen:
+                order.append(sec_id)
+        self.physical_sector_order = order
 
 
     def master_track(self) -> MasterTrack:
